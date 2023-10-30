@@ -3,10 +3,8 @@
 set -eux
 
 function get_hc_kubeconfig() {
-  export KUBECONFIG=${MGMT_KUBECONFIG}
-  export HCPASS=$(oc get secret -n ${HC_CLUSTER_NS} ${HC_CLUSTER_NAME}-kubeadmin-password -o go-template='{{.data.password}}' | base64 -d)
   export KUBECONFIG=${HC_KUBECONFIG}
-  oc login $(rosa describe cluster -c ${HC_CLUSTER_ID} -o json | jq -r .api.url) -u kubeadmin -p ${HCPASS}
+  oc login $(rosa describe cluster -c ${HC_CLUSTER_ID} -o json | jq -r .api.url) -u cluster-admin -p ${HCPASS}
 }
 
 function change_reconciliation() {
@@ -74,6 +72,14 @@ function render_hc_objects {
     mkdir -p ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS} ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}-${HC_CLUSTER_NAME}
     chmod 700 ${BACKUP_DIR}/namespaces/
 
+    export KUBECONFIG="${MGMT_KUBECONFIG}"
+
+    # Certificates
+    echo "Backing Up Certificate Objects:"
+    oc get certificate cluster-api-cert -n ${HC_CLUSTER_NS} -o yaml > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}/certificate-cluster-api-cert.yaml
+    echo "--> Certificate"
+    # sed -i -e '/^status:$/,$d' ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}/hc-${HC_CLUSTER_NAME}.yaml
+
     # HostedCluster
     echo "Backing Up HostedCluster Objects:"
     oc get hc ${HC_CLUSTER_NAME} -n ${HC_CLUSTER_NS} -o yaml > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}/hc-${HC_CLUSTER_NAME}.yaml
@@ -87,14 +93,19 @@ function render_hc_objects {
 
     # Secrets in the HC Namespace
     echo "--> HostedCluster Secrets"
-    for s in $(oc get secret -n ${HC_CLUSTER_NS} --as backplane-cluster-admin | grep "^${HC_CLUSTER_NAME}" | awk '{print $1}'); do
-        oc get secret -n ${HC_CLUSTER_NS} $s -o yaml --as backplane-cluster-admin > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}/secret-${s}.yaml
+    for s in $(oc get secret -n ${HC_CLUSTER_NS}  | grep "^${HC_CLUSTER_NAME}" | awk '{print $1}'); do
+        oc get secret -n ${HC_CLUSTER_NS} $s -o yaml  > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}/secret-${s}.yaml
+    done
+
+    echo "--> HostedCluster Secrets"
+    for s in $(oc get secret -n ${HC_CLUSTER_NS}  | grep bound | awk '{print $1}'); do
+        oc get secret -n ${HC_CLUSTER_NS} $s -o yaml  > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}/secret-${s}.yaml
     done
 
     # Secrets in the HC Control Plane Namespace
     echo "--> HostedCluster ControlPlane Secrets"
-    for s in $(oc get secret -n ${HC_CLUSTER_NS}-${HC_CLUSTER_NAME} --as backplane-cluster-admin | egrep -v "docker|service-account-token|oauth-openshift|NAME|token-${HC_CLUSTER_NAME}" | awk '{print $1}'); do
-        oc get secret --as backplane-cluster-admin -n ${HC_CLUSTER_NS}-${HC_CLUSTER_NAME} $s -o yaml > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}-${HC_CLUSTER_NAME}/secret-${s}.yaml
+    for s in $(oc get secret -n ${HC_CLUSTER_NS}-${HC_CLUSTER_NAME}  | egrep -v "docker|service-account-token|oauth-openshift|NAME|token-${HC_CLUSTER_NAME}" | awk '{print $1}'); do
+        oc get secret  -n ${HC_CLUSTER_NS}-${HC_CLUSTER_NAME} $s -o yaml > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}-${HC_CLUSTER_NAME}/secret-${s}.yaml
     done
 
     # Hosted Control Plane
@@ -210,7 +221,12 @@ function restore_object() {
                 yq 'del(.metadata.ownerReferences,.metadata.creationTimestamp,.metadata.resourceVersion,.metadata.uid,.status)' $f | oc apply -f -
             done
             ;;
-	"hc")
+        "certificate")
+            for f in $(ls -1 ${BACKUP_DIR}/namespaces/${2}/${1}-*); do
+                yq 'del(.metadata.ownerReferences,.metadata.creationTimestamp,.metadata.resourceVersion,.metadata.uid,.status)' $f | oc apply -f -
+            done
+            ;;
+        "hc")
             # Cleaning the YAML files before apply them
             for f in $(ls -1 ${BACKUP_DIR}/namespaces/${2}/${1}-*); do
                 yq 'del(.metadata.ownerReferences,.metadata.creationTimestamp,.metadata.resourceVersion,.metadata.uid,.status,.spec.pausedUntil)' $f | oc apply -f -
@@ -297,6 +313,7 @@ function render_svc_objects() {
 
 function backup_hc() {
     BACKUP_DIR=${HC_CLUSTER_DIR}/backup
+    
     # Create a ConfigMap on the guest so we can tell which management cluster it came from
     export KUBECONFIG=${HC_KUBECONFIG}
     oc create configmap ${USER}-dev-cluster -n default --from-literal=from=${MGMT_CLUSTER_NAME} || true
@@ -328,6 +345,7 @@ function restore_hc() {
     #oc delete ns ${HC_CLUSTER_NS} || true
     oc new-project ${HC_CLUSTER_NS} || oc project ${HC_CLUSTER_NS}
     restore_object "secret" ${HC_CLUSTER_NS}
+    restore_object "certificate" ${HC_CLUSTER_NS}
     oc new-project ${HC_CLUSTER_NS}-${HC_CLUSTER_NAME} || oc project ${HC_CLUSTER_NS}-${HC_CLUSTER_NAME}
     restore_object "secret" ${HC_CLUSTER_NS}-${HC_CLUSTER_NAME}
     restore_object "hcp" ${HC_CLUSTER_NS}-${HC_CLUSTER_NAME}
@@ -459,6 +477,21 @@ function teardown_old_svc() {
 }
 
 REPODIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )/.."
+
+HC_CLUSTER_ID=${1}
+HC_CLUSTER_NAME=${2}
+
+HASH=${HC_CLUSTER_NAME:7:4}
+export HCPASS=guB6b-oZgPj-Ndmx7-$HASH
+
+if [ -z $HC_CLUSTER_ID ]; then
+    exit 1
+fi
+
+if [ -z $HC_CLUSTER_NAME ]; then
+    exit 1
+fi
+
 source $REPODIR/dr-script/common.sh
 
 ## Backup
@@ -469,7 +502,8 @@ echo "Backup Done!"
 ELAPSED="Elapsed: $(($SECONDS / 3600))hrs $((($SECONDS / 60) % 60))min $(($SECONDS % 60))sec"
 echo $ELAPSED
 
-## Migration
+# Migration
+
 SECONDS=0
 echo "Executing the HC Migration"
 restore_hc
@@ -478,7 +512,8 @@ echo "Restoration Done!"
 ELAPSED="Elapsed: $(($SECONDS / 3600))hrs $((($SECONDS / 60) % 60))min $(($SECONDS % 60))sec"
 echo $ELAPSED
 
-## Teardown
+# Teardown
+
 SECONDS=0
 echo "Tearing down the HC in Source Management Cluster"
 teardown_old_svc

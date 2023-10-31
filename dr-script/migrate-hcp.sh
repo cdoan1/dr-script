@@ -101,6 +101,9 @@ function render_hc_objects {
     for s in $(oc get secret -n ${HC_CLUSTER_NS}  | grep bound | awk '{print $1}'); do
         oc get secret -n ${HC_CLUSTER_NS} $s -o yaml  > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}/secret-${s}.yaml
     done
+    for s in $(oc get secret -n ${HC_CLUSTER_NS}  | grep htpasswd-secret | awk '{print $1}'); do
+        oc get secret -n ${HC_CLUSTER_NS} $s -o yaml  > ${BACKUP_DIR}/namespaces/${HC_CLUSTER_NS}/secret-${s}.yaml
+    done
 
     # Secrets in the HC Control Plane Namespace
     echo "--> HostedCluster ControlPlane Secrets"
